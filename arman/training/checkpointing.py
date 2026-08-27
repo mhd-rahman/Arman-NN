@@ -57,6 +57,7 @@ def load_checkpoint(
     optimizer: Optimizer | None = None,
     scheduler: LRScheduler | None = None,
     device: str | torch.device = "cpu",
+    strict: bool = True,
 ) -> dict:
     """Load a checkpoint and restore model/optimizer/scheduler state.
 
@@ -66,6 +67,8 @@ def load_checkpoint(
         optimizer: Optimizer to restore state into (optional).
         scheduler: Scheduler to restore state into (optional).
         device: Device to map tensors to during load.
+        strict: If True, keys must match exactly. If False, loads matching keys
+                and ignores missing/unexpected ones (useful for architecture changes).
 
     Returns:
         Dict with 'step', 'config', and optional 'extra' keys.
@@ -78,10 +81,26 @@ def load_checkpoint(
 
     # Handle DDP-wrapped model
     model_to_load = model.module if hasattr(model, "module") else model
-    model_to_load.load_state_dict(state["model"])
+    result = model_to_load.load_state_dict(state["model"], strict=strict)
+    if not strict and (result.missing_keys or result.unexpected_keys):
+        import logging
+        logger = logging.getLogger(__name__)
+        if result.missing_keys:
+            logger.info(f"Checkpoint missing keys (randomly initialized): {result.missing_keys}")
+        if result.unexpected_keys:
+            logger.info(f"Checkpoint unexpected keys (ignored): {result.unexpected_keys}")
 
     if optimizer is not None and "optimizer" in state:
-        optimizer.load_state_dict(state["optimizer"])
+        try:
+            optimizer.load_state_dict(state["optimizer"])
+        except (ValueError, KeyError):
+            if not strict:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Optimizer state incompatible with new model — starting optimizer fresh."
+                )
+            else:
+                raise
     if scheduler is not None and "scheduler" in state:
         scheduler.load_state_dict(state["scheduler"])
 
