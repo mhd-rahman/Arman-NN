@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 from .block import ArmanBlock
 from .graph import GraphProcessor
 from .memory import NeuralMemory
@@ -9,6 +10,7 @@ class ArmanNN(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.gradient_checkpointing = False
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.position_embedding = nn.Embedding(config.max_seq_len, config.d_model)
         self.blocks = nn.ModuleList([ArmanBlock(config) for _ in range(config.n_layers)])
@@ -22,6 +24,14 @@ class ArmanNN(nn.Module):
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         if config.tie_embeddings:
             self.lm_head.weight = self.token_embedding.weight
+
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing to reduce memory at the cost of ~30% slower training."""
+        self.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self):
+        """Disable gradient checkpointing."""
+        self.gradient_checkpointing = False
 
     def forward(self, input_ids, graph_nodes=None, adjacency=None, targets=None, past_key_values=None):
         """
@@ -60,9 +70,14 @@ class ArmanNN(nn.Module):
             if use_cache and past_key_values[i] is not None:
                 layer_past_kv, layer_past_ssm = past_key_values[i]
 
-            x, block_aux, present_kv, present_ssm = block(
-                x, past_kv=layer_past_kv, past_ssm_state=layer_past_ssm
-            )
+            if self.gradient_checkpointing and self.training and not use_cache:
+                x, block_aux, present_kv, present_ssm = gradient_checkpoint(
+                    block, x, layer_past_kv, layer_past_ssm, use_reentrant=False
+                )
+            else:
+                x, block_aux, present_kv, present_ssm = block(
+                    x, past_kv=layer_past_kv, past_ssm_state=layer_past_ssm
+                )
             aux_loss = aux_loss + block_aux
             present_key_values.append((present_kv, present_ssm))
 
