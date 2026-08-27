@@ -5,3 +5,4 @@ datasets>=2.18
 transformers>=4.40
 kaggle>=1.6
 pandas>=2.0
+flash-attn>=2.5
