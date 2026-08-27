@@ -1,0 +1,4 @@
+datasets>=2.18
+transformers>=4.40
+numpy>=1.24
+flash-attn>=2.5 --no-build-isolation
