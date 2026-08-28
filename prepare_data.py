@@ -85,6 +85,22 @@ def save_shard(tokens: list[int], shard_id: int, output_dir: Path, dtype: np.dty
 # Main pipeline
 # ---------------------------------------------------------------------------
 
+def _save_progress(progress_path: Path, next_shard_id: int, tokens_written: int,
+                   docs_processed: int, shards_meta: list[dict]) -> None:
+    """Save progress after each shard so we can resume if interrupted."""
+    progress = {
+        "next_shard_id": next_shard_id,
+        "tokens_written": tokens_written,
+        "docs_processed": docs_processed,
+        "shards": shards_meta,
+    }
+    # Write to temp file first, then rename for atomicity
+    tmp_path = progress_path.with_suffix(".tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(progress, f)
+    tmp_path.rename(progress_path)
+
+
 def prepare_dataset(
     dataset_name: str,
     output_dir: Path,
@@ -142,6 +158,32 @@ def prepare_dataset(
     logger.info(f"Vocab size: {vocab_size} → using {dtype_str}")
     logger.info(f"Target: {target_tokens:,} tokens in shards of {shard_size:,}")
 
+    # ------------------------------------------------------------------
+    # Resume support: check for progress.json from a previous interrupted run
+    # ------------------------------------------------------------------
+    progress_path = output_dir / "progress.json"
+    resumed = False
+
+    if progress_path.exists():
+        with open(progress_path) as f:
+            progress = json.load(f)
+        shard_id = progress["next_shard_id"]
+        tokens_written = progress["tokens_written"]
+        docs_processed = progress["docs_processed"]
+        shards_meta = progress["shards"]
+        tokens_to_skip = tokens_written  # we need to skip this many tokens in the stream
+        resumed = True
+        logger.info(
+            f"Resuming from progress.json: {tokens_written:,} tokens already written "
+            f"in {shard_id} shards. Skipping ahead..."
+        )
+    else:
+        shard_id = 0
+        tokens_written = 0
+        docs_processed = 0
+        shards_meta = []
+        tokens_to_skip = 0
+
     # Load dataset (streaming for large datasets)
     logger.info(f"Loading dataset: {dataset_name} (subset={subset}, split={split}, streaming={streaming})")
     load_kwargs = {"split": split, "streaming": streaming}
@@ -157,11 +199,11 @@ def prepare_dataset(
 
     # Tokenize and write shards
     buffer: list[int] = []
-    shard_id = 0
-    tokens_written = 0
-    docs_processed = 0
-    shards_meta: list[dict] = []
     t_start = time.time()
+    skip_tokens_remaining = tokens_to_skip
+
+    if resumed:
+        logger.info(f"Fast-forwarding through ~{tokens_to_skip:,} tokens already processed...")
 
     logger.info("Starting tokenization...")
 
@@ -173,6 +215,12 @@ def prepare_dataset(
         # Tokenize with EOS separator between documents
         ids = tokenizer.encode(text, add_special_tokens=False)
         ids.append(eos_id)
+
+        # Skip tokens we already wrote in a previous run
+        if skip_tokens_remaining > 0:
+            skip_tokens_remaining -= len(ids)
+            docs_processed += 1
+            continue
 
         buffer.extend(ids)
         docs_processed += 1
@@ -187,11 +235,16 @@ def prepare_dataset(
             tokens_written += len(shard_tokens)
             shard_id += 1
 
+            # Save progress after each shard (enables resume)
+            _save_progress(progress_path, shard_id, tokens_written, docs_processed, shards_meta)
+
             # Progress logging
             if shard_id % 5 == 0:
                 elapsed = time.time() - t_start
-                rate = tokens_written / elapsed
-                eta = (target_tokens - tokens_written) / rate if rate > 0 else 0
+                tokens_this_session = tokens_written - tokens_to_skip
+                rate = tokens_this_session / elapsed if elapsed > 0 else 0
+                remaining = target_tokens - tokens_written
+                eta = remaining / rate if rate > 0 else 0
                 logger.info(
                     f"  Progress: {tokens_written:,}/{target_tokens:,} tokens "
                     f"({100 * tokens_written / target_tokens:.1f}%) | "
@@ -207,10 +260,12 @@ def prepare_dataset(
         meta = save_shard(buffer, shard_id, output_dir, dtype)
         shards_meta.append(meta)
         tokens_written += len(buffer)
+        shard_id += 1
+        _save_progress(progress_path, shard_id, tokens_written, docs_processed, shards_meta)
 
     elapsed = time.time() - t_start
     logger.info(
-        f"Done! {tokens_written:,} tokens in {shard_id + 1} shards | "
+        f"Done! {tokens_written:,} tokens in {len(shards_meta)} shards | "
         f"{docs_processed:,} documents | {elapsed:.1f}s"
     )
 
@@ -248,6 +303,11 @@ def prepare_dataset(
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
     logger.info(f"Manifest written to {manifest_path}")
+
+    # Clean up progress file — preparation is complete
+    if progress_path.exists():
+        progress_path.unlink()
+        logger.info("Removed progress.json (preparation complete)")
 
     return manifest
 
