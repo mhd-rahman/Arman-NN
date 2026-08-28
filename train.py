@@ -17,6 +17,7 @@ Usage:
 import argparse
 import csv
 import json
+import signal
 import logging
 import time
 from pathlib import Path
@@ -70,48 +71,52 @@ DOWNSTREAM_TASKS = [
 ]
 
 
-def run_generation_suite(model, tokenizer, device, max_new_tokens=50):
+def run_generation_suite(model, tokenizer, device, max_new_tokens=50, amp_dtype=torch.bfloat16):
     """Run fixed generation prompts and return results."""
     from generate import generate
 
     model.eval()
     results = []
+    use_amp = device.type == "cuda"
 
     for prompt in GENERATION_PROMPTS:
         input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-        output_ids = generate(
-            model,
-            input_ids,
-            max_new_tokens=max_new_tokens,
-            temperature=0.8,
-            top_k=50,
-            top_p=0.9,
-            repetition_penalty=1.1,
-        )
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+            output_ids = generate(
+                model,
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=0.8,
+                top_k=50,
+                top_p=0.9,
+                repetition_penalty=1.1,
+            )
         text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
         results.append({"prompt": prompt, "generated": text})
 
     return results
 
 
-def run_downstream_eval(model, tokenizer, device, max_new_tokens=20):
+def run_downstream_eval(model, tokenizer, device, max_new_tokens=20, amp_dtype=torch.bfloat16):
     """Run basic factual downstream eval and return accuracy."""
     from generate import generate
 
     model.eval()
     correct = 0
+    use_amp = device.type == "cuda"
 
     for prompt, expected in DOWNSTREAM_TASKS:
         input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-        output_ids = generate(
-            model,
-            input_ids,
-            max_new_tokens=max_new_tokens,
-            temperature=0.01,  # near-greedy
-            top_k=1,
-            top_p=1.0,
-            repetition_penalty=1.0,
-        )
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+            output_ids = generate(
+                model,
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=0.01,  # near-greedy
+                top_k=1,
+                top_p=1.0,
+                repetition_penalty=1.0,
+            )
         generated = tokenizer.decode(output_ids[0], skip_special_tokens=True)
         # Check if expected substring appears in the continuation
         continuation = generated[len(prompt):]
@@ -231,6 +236,10 @@ def main():
     # Misc
     p.add_argument("--device", default="auto")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--num_workers", type=int, default=2,
+                   help="DataLoader worker processes (0 for main-process loading)")
+    p.add_argument("--skip_data", type=str, default="true", choices=["true", "false"],
+                   help="On resume, skip already-seen data batches (true) or start data from beginning (false)")
 
     args = p.parse_args()
 
@@ -381,6 +390,9 @@ def main():
             global_step = info["step"]
             if is_main_process():
                 logger.info(f"Resumed at step {global_step}")
+        else:
+            if is_main_process():
+                logger.info("No checkpoint found — starting fresh from step 0")
 
     # ================================================================
     # Eval setup
@@ -432,9 +444,10 @@ def main():
         batch_size=args.batch_size,
         shuffle=(sampler is None),
         sampler=sampler,
-        num_workers=0,
+        num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
+        persistent_workers=args.num_workers > 0,
     )
 
     tokens_per_step = args.batch_size * args.grad_accum * world_size * args.seq_len
@@ -447,10 +460,53 @@ def main():
         )
 
     # ================================================================
+    # Checkpoint helper (used for periodic saves, graceful shutdown, and rotation)
+    # ================================================================
+    def save_and_rotate(step):
+        ckpt_path = Path(args.checkpoint_dir) / f"step_{step:06d}.pt"
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        save_checkpoint(ckpt_path, model, optimizer, scheduler, step, cfg)
+        logger.info(f"Saved checkpoint: {ckpt_path}")
+        existing = sorted(Path(args.checkpoint_dir).glob("step_*.pt"))
+        while len(existing) > args.keep_checkpoints:
+            old = existing.pop(0)
+            old.unlink()
+            logger.info(f"Removed old checkpoint: {old}")
+        return ckpt_path
+
+    # ================================================================
+    # Graceful shutdown — save checkpoint on SIGINT/SIGTERM
+    # ================================================================
+    shutdown_requested = {"flag": False}
+
+    def _handle_shutdown(signum, frame):
+        logger.warning(f"Received signal {signum} — will save checkpoint and exit after current step.")
+        shutdown_requested["flag"] = True
+
+    signal.signal(signal.SIGINT, _handle_shutdown)
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+
+    # ================================================================
     # Training loop
     # ================================================================
     model.train()
     data_iter = iter(dataloader)
+
+    # On resume: optionally fast-forward the data iterator past batches already
+    # consumed so we don't retrain on the same data. Controlled by --skip_data.
+    if global_step > 0 and args.skip_data == "true":
+        batches_to_skip = (global_step * args.grad_accum) % len(dataloader) if len(dataloader) > 0 else 0
+        if batches_to_skip > 0 and is_main_process():
+            logger.info(f"Fast-forwarding data iterator by {batches_to_skip:,} batches to resume position...")
+        for _ in range(batches_to_skip):
+            try:
+                next(data_iter)
+            except StopIteration:
+                data_iter = iter(dataloader)
+                next(data_iter)
+    elif global_step > 0 and is_main_process():
+        logger.info("skip_data=false — resuming data from the beginning (not skipping seen batches)")
+
     optimizer.zero_grad(set_to_none=True)
     step_start = time.time()
     running_loss = 0.0
@@ -477,6 +533,19 @@ def main():
             accum_loss += out["loss"].item() / args.grad_accum
             accum_aux += out["aux_loss"].item() / args.grad_accum
 
+        # NaN/Inf detection — skip the update rather than corrupt the model
+        if not torch.isfinite(torch.tensor(accum_loss)):
+            logger.warning(
+                f"step={global_step + 1}: non-finite loss ({accum_loss}), "
+                f"skipping optimizer step and zeroing grads."
+            )
+            optimizer.zero_grad(set_to_none=True)
+            global_step += 1
+            if shutdown_requested["flag"] and is_main_process():
+                save_and_rotate(global_step)
+                break
+            continue
+
         scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
         scaler.step(optimizer)
@@ -485,6 +554,13 @@ def main():
         scheduler.step()
 
         global_step += 1
+
+        # Graceful shutdown — save and exit
+        if shutdown_requested["flag"]:
+            if is_main_process():
+                logger.info("Saving checkpoint before shutdown...")
+                save_and_rotate(global_step)
+            break
         running_loss += accum_loss
         running_count += 1
 
@@ -516,7 +592,7 @@ def main():
             eval_metrics = evaluator.evaluate(eval_dataset)
 
             # Downstream eval
-            downstream = run_downstream_eval(model, tokenizer, device)
+            downstream = run_downstream_eval(model, tokenizer, device, amp_dtype=amp_dtype)
 
             # Log table row
             row = log_eval_table(
@@ -542,7 +618,7 @@ def main():
             )
 
             # Fixed generation suite
-            gen_results = run_generation_suite(model, tokenizer, device)
+            gen_results = run_generation_suite(model, tokenizer, device, amp_dtype=amp_dtype)
             gen_log_path = Path(args.checkpoint_dir) / f"generations_step_{global_step:06d}.json"
             gen_log_path.parent.mkdir(parents=True, exist_ok=True)
             with open(gen_log_path, "w") as f:
@@ -563,22 +639,12 @@ def main():
         # Checkpoint (every save_every steps)
         # --------------------------------------------------------
         if is_main_process() and global_step % args.save_every == 0:
-            ckpt_path = Path(args.checkpoint_dir) / f"step_{global_step:06d}.pt"
-            ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-            save_checkpoint(ckpt_path, model, optimizer, scheduler, global_step, cfg)
-            logger.info(f"Saved checkpoint: {ckpt_path}")
-
-            # Keep only last N checkpoints
-            existing = sorted(Path(args.checkpoint_dir).glob("step_*.pt"))
-            while len(existing) > args.keep_checkpoints:
-                old = existing.pop(0)
-                old.unlink()
-                logger.info(f"Removed old checkpoint: {old}")
+            save_and_rotate(global_step)
 
     # ================================================================
     # Final save
     # ================================================================
-    if is_main_process():
+    if is_main_process() and not shutdown_requested["flag"]:
         ckpt_path = Path(args.checkpoint_dir) / f"step_{global_step:06d}.pt"
         ckpt_path.parent.mkdir(parents=True, exist_ok=True)
         save_checkpoint(ckpt_path, model, optimizer, scheduler, global_step, cfg)

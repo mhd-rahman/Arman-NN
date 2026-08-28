@@ -33,7 +33,8 @@ class ArmanNN(nn.Module):
         """Disable gradient checkpointing."""
         self.gradient_checkpointing = False
 
-    def forward(self, input_ids, graph_nodes=None, adjacency=None, targets=None, past_key_values=None):
+    def forward(self, input_ids, graph_nodes=None, adjacency=None, targets=None,
+                past_key_values=None, attention_mask=None):
         """
         Args:
             input_ids: (batch, seq_len) token ids
@@ -41,6 +42,7 @@ class ArmanNN(nn.Module):
             adjacency: optional adjacency matrix
             targets: optional target ids for loss computation
             past_key_values: list of (past_kv, past_ssm_state) per layer for cached generation
+            attention_mask: optional (batch, seq_len) mask, 1 = keep, 0 = pad
         Returns:
             dict with logits, loss, aux_loss, memory_write_signal, present_key_values
         """
@@ -72,11 +74,13 @@ class ArmanNN(nn.Module):
 
             if self.gradient_checkpointing and self.training and not use_cache:
                 x, block_aux, present_kv, present_ssm = gradient_checkpoint(
-                    block, x, layer_past_kv, layer_past_ssm, use_reentrant=False
+                    block, x, layer_past_kv, layer_past_ssm, attention_mask,
+                    use_reentrant=False
                 )
             else:
                 x, block_aux, present_kv, present_ssm = block(
-                    x, past_kv=layer_past_kv, past_ssm_state=layer_past_ssm
+                    x, past_kv=layer_past_kv, past_ssm_state=layer_past_ssm,
+                    attention_mask=attention_mask,
                 )
             aux_loss = aux_loss + block_aux
             present_key_values.append((present_kv, present_ssm))
@@ -100,6 +104,9 @@ class ArmanNN(nn.Module):
         logits = self.lm_head(self.final_norm(x))
         loss = None
         if targets is not None:
+            # Mask out padded positions in the loss if attention_mask is provided
+            if attention_mask is not None:
+                targets = targets.masked_fill(attention_mask == 0, -100)
             loss = torch.nn.functional.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100
             )

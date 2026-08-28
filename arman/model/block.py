@@ -24,7 +24,7 @@ class ArmanBlock(nn.Module):
         n_paths = int(self.mlp is not None) + int(self.moe is not None)
         self.router = PathRouter(d, n_paths) if config.use_router and n_paths > 1 else None
 
-    def _sequence_mix(self, h, past_kv=None, past_ssm_state=None):
+    def _sequence_mix(self, h, past_kv=None, past_ssm_state=None, attention_mask=None):
         present_kv = None
         present_ssm_state = None
 
@@ -32,7 +32,7 @@ class ArmanBlock(nn.Module):
         s = None
 
         if self.attn is not None:
-            a, present_kv = self.attn(h, past_kv=past_kv)
+            a, present_kv = self.attn(h, past_kv=past_kv, attention_mask=attention_mask)
         if self.ssm is not None:
             s, present_ssm_state = self.ssm(h, past_state=past_ssm_state)
 
@@ -61,9 +61,10 @@ class ArmanBlock(nn.Module):
         stacked = torch.stack(paths, dim=-2)
         return (stacked * weights.unsqueeze(-1)).sum(dim=-2), aux
 
-    def forward(self, x, past_kv=None, past_ssm_state=None):
+    def forward(self, x, past_kv=None, past_ssm_state=None, attention_mask=None):
         seq, present_kv, present_ssm_state = self._sequence_mix(
-            self.norm1(x), past_kv=past_kv, past_ssm_state=past_ssm_state
+            self.norm1(x), past_kv=past_kv, past_ssm_state=past_ssm_state,
+            attention_mask=attention_mask,
         )
         if seq is not None:
             x = x + seq
