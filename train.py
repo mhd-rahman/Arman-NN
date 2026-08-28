@@ -220,11 +220,13 @@ def main():
     p.add_argument("--save_every", type=int, default=2000)
     p.add_argument("--eval_every", type=int, default=2000)
     p.add_argument("--log_every", type=int, default=50)
-    p.add_argument("--keep_checkpoints", type=int, default=2, help="Number of checkpoints to keep")
+    p.add_argument("--keep_checkpoints", type=int, default=5, help="Number of checkpoints to keep")
     p.add_argument("--resume", action="store_true", default=True)
     p.add_argument("--no_resume", action="store_true")
     p.add_argument("--metrics_log", type=str, default="training_metrics.csv",
                    help="CSV file for eval metrics log")
+    p.add_argument("--eval_data", type=str, default=None,
+                   help="Path to eval dataset: binary shard dir, .pt cache file, or 'none' to skip eval")
 
     # Misc
     p.add_argument("--device", default="auto")
@@ -255,8 +257,26 @@ def main():
         logger.info(f"Loading dataset: source={args.dataset_source}, name={args.dataset_name}")
 
     if args.dataset_source == "binary":
-        # Support comma-separated multiple shard directories
+        # Support comma-separated dirs OR a parent dir with subfolders
         dirs = [d.strip() for d in args.dataset_name.split(",") if d.strip()]
+
+        # If a single dir is given, check if it has subfolders with manifest.json
+        if len(dirs) == 1:
+            parent = Path(dirs[0])
+            subfolders = sorted([
+                d for d in parent.iterdir()
+                if d.is_dir() and (d / "manifest.json").exists()
+            ]) if parent.is_dir() and not (parent / "manifest.json").exists() else []
+
+            if subfolders:
+                # Parent dir with multiple shard subdirectories
+                dirs = [str(d) for d in subfolders]
+                if is_main_process():
+                    logger.info(f"Found {len(dirs)} shard subdirectories in {parent}:")
+            elif (parent / "manifest.json").exists():
+                # Single shard dir
+                dirs = [str(parent)]
+
         if len(dirs) == 1:
             dataset = BinaryShardDataset(dirs[0], seq_len=args.seq_len)
         else:
@@ -265,6 +285,7 @@ def main():
             if is_main_process():
                 for d, ds in zip(dirs, datasets):
                     logger.info(f"  {Path(d).name}: {ds.total_tokens:,} tokens")
+
         # Get vocab size from first directory's manifest
         first_ds = dataset.datasets[0] if isinstance(dataset, ConcatDataset) else dataset
         vocab_size = first_ds.vocab_size
@@ -367,9 +388,40 @@ def main():
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
 
+    eval_dataset = None
     if is_main_process():
-        eval_dataset = build_eval_dataset(tokenizer, args.seq_len)
-        logger.info(f"Eval dataset: {len(eval_dataset)} sequences")
+        if args.eval_data and args.eval_data.lower() != "none":
+            eval_path = Path(args.eval_data)
+            if eval_path.suffix == ".pt":
+                # Pre-cached .pt file
+                eval_dataset = build_eval_dataset(tokenizer, args.seq_len, cache_path=str(eval_path))
+            elif eval_path.is_dir():
+                # Binary shard directory (single dir or parent with subfolders)
+                subfolders = sorted([
+                    d for d in eval_path.iterdir()
+                    if d.is_dir() and (d / "manifest.json").exists()
+                ]) if not (eval_path / "manifest.json").exists() else []
+
+                if subfolders:
+                    eval_datasets = [BinaryShardDataset(str(d), seq_len=args.seq_len) for d in subfolders]
+                    eval_dataset = ConcatDataset(eval_datasets)
+                    logger.info(f"Eval: {len(subfolders)} shard subdirs, {len(eval_dataset)} sequences")
+                elif (eval_path / "manifest.json").exists():
+                    eval_dataset = BinaryShardDataset(str(eval_path), seq_len=args.seq_len)
+                    logger.info(f"Eval: {len(eval_dataset)} sequences from {eval_path}")
+                else:
+                    logger.warning(f"Eval path {eval_path} has no manifest.json or subfolders — skipping eval")
+            else:
+                logger.warning(f"Eval path {args.eval_data} not found — skipping eval")
+        elif args.eval_data is None:
+            # Fall back to eval_dataset.pt if it exists
+            if Path("eval_dataset.pt").exists():
+                eval_dataset = build_eval_dataset(tokenizer, args.seq_len)
+            else:
+                logger.info("No eval dataset specified and eval_dataset.pt not found — skipping eval")
+
+        if eval_dataset is not None:
+            logger.info(f"Eval dataset: {len(eval_dataset)} sequences")
 
     # ================================================================
     # DataLoader
@@ -454,7 +506,7 @@ def main():
         # --------------------------------------------------------
         # Eval + Generation + Downstream (every eval_every steps)
         # --------------------------------------------------------
-        if is_main_process() and global_step % args.eval_every == 0:
+        if is_main_process() and global_step % args.eval_every == 0 and eval_dataset is not None:
             tokens_seen = global_step * tokens_per_step
             avg_train_loss = running_loss / running_count if running_count > 0 else 0.0
 
