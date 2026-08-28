@@ -97,6 +97,7 @@ def prepare_dataset(
     streaming: bool = True,
     seed: int = 42,
     max_seq_len: int = 1024,
+    hf_token: str | None = None,
 ) -> dict:
     """Download, tokenize, and shard a dataset.
 
@@ -112,6 +113,7 @@ def prepare_dataset(
         streaming: Use streaming mode (recommended for large datasets).
         seed: Shuffle seed for streaming datasets.
         max_seq_len: Sequence length (for manifest metadata only).
+        hf_token: HuggingFace access token for gated datasets (e.g. StarCoderData).
 
     Returns:
         Manifest dict describing the prepared data.
@@ -143,6 +145,8 @@ def prepare_dataset(
     # Load dataset (streaming for large datasets)
     logger.info(f"Loading dataset: {dataset_name} (subset={subset}, split={split}, streaming={streaming})")
     load_kwargs = {"split": split, "streaming": streaming}
+    if hf_token:
+        load_kwargs["token"] = hf_token
     if subset:
         ds = load_dataset(dataset_name, subset, **load_kwargs)
     else:
@@ -327,6 +331,8 @@ def main():
                    help="Shuffle seed for streaming (default: 42)")
     p.add_argument("--no_streaming", action="store_true",
                    help="Disable streaming (loads full dataset into memory)")
+    p.add_argument("--hf_token", type=str, default=None,
+                   help="HuggingFace access token for gated datasets (or set HF_TOKEN env var)")
     p.add_argument("--validate", action="store_true",
                    help="Validate existing shards against manifest (skip preparation)")
 
@@ -336,6 +342,10 @@ def main():
     if args.validate:
         success = validate_shards(output_dir)
         raise SystemExit(0 if success else 1)
+
+    # Resolve HF token: CLI arg > env var
+    import os as _os
+    hf_token = args.hf_token or _os.environ.get("HF_TOKEN")
 
     prepare_dataset(
         dataset_name=args.dataset,
@@ -349,6 +359,7 @@ def main():
         streaming=not args.no_streaming,
         seed=args.seed,
         max_seq_len=args.seq_len,
+        hf_token=hf_token,
     )
 
 
