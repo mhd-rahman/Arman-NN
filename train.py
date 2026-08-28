@@ -1,4 +1,4 @@
-"""Training script for ArmanNN with HuggingFace and Kaggle dataset support.
+"""Training script for ArmanNN with HuggingFace, Kaggle, and pre-tokenized binary shard support.
 
 Usage:
     # Train on a HuggingFace dataset:
@@ -7,12 +7,15 @@ Usage:
     # Train on a Kaggle dataset:
     python train.py --dataset_source kaggle --dataset_name username/dataset-name
 
+    # Train on pre-tokenized binary shards (fastest, recommended for large runs):
+    python train.py --dataset_source binary --dataset_name ./data/pretrain/fineweb
+
     # With custom tokenizer and sequence length:
     python train.py --dataset_source huggingface --dataset_name openwebtext \\
         --tokenizer gpt2 --seq_len 512 --steps 5000
 
     # Distributed training:
-    torchrun --nproc_per_node=4 train.py --dataset_source huggingface --dataset_name openwebtext
+    torchrun --nproc_per_node=4 train.py --dataset_source binary --dataset_name ./data/pretrain/fineweb
 """
 
 import argparse
@@ -35,10 +38,10 @@ def main():
     p = argparse.ArgumentParser(description="Train ArmanNN")
 
     # Dataset arguments
-    p.add_argument("--dataset_source", type=str, required=True, choices=["huggingface", "kaggle"],
-                   help="Dataset source: 'huggingface' or 'kaggle'")
+    p.add_argument("--dataset_source", type=str, required=True, choices=["huggingface", "kaggle", "binary"],
+                   help="Dataset source: 'huggingface', 'kaggle', or 'binary' (pre-tokenized shards)")
     p.add_argument("--dataset_name", type=str, required=True,
-                   help="Dataset identifier (e.g. 'wikitext' for HF, 'username/dataset' for Kaggle)")
+                   help="Dataset identifier (HF name, Kaggle 'user/dataset', or path to binary shard dir)")
     p.add_argument("--subset", type=str, default=None,
                    help="Dataset subset/config name (HuggingFace only, e.g. 'wikitext-2-raw-v1')")
     p.add_argument("--split", type=str, default="train",
@@ -123,10 +126,15 @@ def main():
     if is_main_process():
         logger.info(f"Dataset ready: {len(dataset)} sequences of length {args.seq_len}")
 
-    # Get vocab size from tokenizer
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-    vocab_size = tokenizer.vocab_size
+    # Get vocab size: from manifest for binary shards, from tokenizer otherwise
+    if args.dataset_source == "binary":
+        vocab_size = dataset.vocab_size
+        if is_main_process():
+            logger.info(f"Vocab size from binary manifest: {vocab_size}")
+    else:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+        vocab_size = tokenizer.vocab_size
 
     # Model config
     cfg = ArmanConfig(

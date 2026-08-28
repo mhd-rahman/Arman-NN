@@ -1,10 +1,12 @@
-"""Dataset loading from HuggingFace Hub and Kaggle with tokenization."""
+"""Dataset loading from HuggingFace Hub, Kaggle, and pre-tokenized binary shards."""
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
@@ -37,6 +39,149 @@ class TextDataset(Dataset):
         x = self.token_ids[start : start + self.seq_len]
         y = self.token_ids[start + 1 : start + self.seq_len + 1]
         return x, y
+
+
+class BinaryShardDataset(Dataset):
+    """Memory-mapped dataset over pre-tokenized binary shards.
+
+    Reads a manifest.json and memory-maps all shard .bin files for
+    zero-copy, random-access training without loading data into RAM.
+
+    Expected directory layout:
+        data_dir/
+        ├── manifest.json
+        ├── train-00000.bin
+        ├── train-00001.bin
+        └── ...
+
+    Each .bin file contains token IDs stored as uint16 or uint32 (specified in manifest).
+    """
+
+    def __init__(self, data_dir: str | Path, seq_len: int = 1024, shuffle_shards: bool = False):
+        """
+        Args:
+            data_dir: Path to directory containing manifest.json and .bin shards.
+            seq_len: Training sequence length.
+            shuffle_shards: If True, randomize shard order (useful for multi-source mixing).
+        """
+        self.data_dir = Path(data_dir)
+        self.seq_len = seq_len
+
+        # Load manifest
+        manifest_path = self.data_dir / "manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"No manifest.json found in {self.data_dir}. "
+                f"Run prepare_data.py first to create binary shards."
+            )
+
+        with open(manifest_path) as f:
+            self.manifest = json.load(f)
+
+        # Parse format info
+        dtype_str = self.manifest["format"]["dtype"]
+        self.dtype = np.dtype(dtype_str)
+        self.vocab_size = self.manifest["tokenizer"]["vocab_size"]
+
+        # Memory-map all shards
+        shard_metas = self.manifest["shards"]
+        if shuffle_shards:
+            import random
+            shard_metas = shard_metas.copy()
+            random.shuffle(shard_metas)
+
+        self._shards: list[np.ndarray] = []
+        self._shard_offsets: list[int] = []  # cumulative token offset for each shard
+        total_tokens = 0
+
+        for shard_meta in shard_metas:
+            path = self.data_dir / shard_meta["filename"]
+            if not path.exists():
+                raise FileNotFoundError(f"Shard file missing: {path}")
+
+            mmap = np.memmap(path, dtype=self.dtype, mode="r")
+            self._shards.append(mmap)
+            self._shard_offsets.append(total_tokens)
+            total_tokens += len(mmap)
+
+        self._total_tokens = total_tokens
+        # We need seq_len + 1 tokens for each sample (x and shifted y)
+        self.n_samples = (total_tokens - 1) // seq_len
+
+        logger.info(
+            f"BinaryShardDataset: {len(self._shards)} shards | "
+            f"{self._total_tokens:,} tokens | {self.n_samples:,} sequences of length {seq_len}"
+        )
+
+    def __len__(self) -> int:
+        return self.n_samples
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        start = idx * self.seq_len
+        end = start + self.seq_len + 1  # +1 for the target shift
+
+        # Fast path: if the slice falls within a single shard
+        tokens = self._read_range(start, end)
+
+        x = torch.from_numpy(tokens[:self.seq_len].astype(np.int64))
+        y = torch.from_numpy(tokens[1:self.seq_len + 1].astype(np.int64))
+        return x, y
+
+    def _read_range(self, start: int, end: int) -> np.ndarray:
+        """Read a contiguous range of tokens across shard boundaries."""
+        # Binary search for the starting shard
+        shard_idx = self._find_shard(start)
+
+        result = []
+        remaining = end - start
+        pos = start
+
+        while remaining > 0:
+            shard_start = self._shard_offsets[shard_idx]
+            shard = self._shards[shard_idx]
+            local_start = pos - shard_start
+            available = len(shard) - local_start
+            take = min(available, remaining)
+
+            result.append(shard[local_start:local_start + take])
+            remaining -= take
+            pos += take
+            shard_idx += 1
+
+        return np.concatenate(result) if len(result) > 1 else result[0]
+
+    def _find_shard(self, global_pos: int) -> int:
+        """Binary search for which shard contains global_pos."""
+        lo, hi = 0, len(self._shard_offsets) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self._shard_offsets[mid] <= global_pos:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    @property
+    def total_tokens(self) -> int:
+        return self._total_tokens
+
+
+def load_binary_dataset(
+    data_dir: str | Path,
+    seq_len: int = 1024,
+    shuffle_shards: bool = False,
+) -> BinaryShardDataset:
+    """Load a pre-tokenized binary shard dataset.
+
+    Args:
+        data_dir: Path to directory with manifest.json and .bin shard files.
+        seq_len: Training sequence length.
+        shuffle_shards: Randomize shard order.
+
+    Returns:
+        BinaryShardDataset ready for training.
+    """
+    return BinaryShardDataset(data_dir=data_dir, seq_len=seq_len, shuffle_shards=shuffle_shards)
 
 
 def _get_tokenizer(tokenizer_name: str):
@@ -217,12 +362,13 @@ def load_dataset_from_source(
     max_samples: int = 0,
     subset: str | None = None,
     **kwargs,
-) -> TextDataset:
+) -> TextDataset | BinaryShardDataset:
     """Unified entry point for loading datasets from any supported source.
 
     Args:
-        source: One of 'huggingface' or 'kaggle'.
+        source: One of 'huggingface', 'kaggle', or 'binary'.
         dataset_name: Dataset identifier for the chosen source.
+            For 'binary' source, this is the path to the data directory.
         tokenizer_name: HuggingFace tokenizer name.
         seq_len: Training sequence length.
         split: Dataset split (HuggingFace only).
@@ -232,7 +378,7 @@ def load_dataset_from_source(
         **kwargs: Additional source-specific arguments.
 
     Returns:
-        TextDataset ready for training.
+        Dataset ready for training.
     """
     source = source.lower().strip()
 
@@ -255,5 +401,13 @@ def load_dataset_from_source(
             max_samples=max_samples,
             **kwargs,
         )
+    elif source == "binary":
+        return load_binary_dataset(
+            data_dir=dataset_name,
+            seq_len=seq_len,
+            shuffle_shards=kwargs.get("shuffle_shards", False),
+        )
     else:
-        raise ValueError(f"Unsupported dataset source: '{source}'. Use 'huggingface' or 'kaggle'.")
+        raise ValueError(
+            f"Unsupported dataset source: '{source}'. Use 'huggingface', 'kaggle', or 'binary'."
+        )
