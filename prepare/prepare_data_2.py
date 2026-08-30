@@ -87,6 +87,10 @@ DATA_SOURCES = [
         "subset": None,
         "text_column": "text",
         "target_tokens": 250_000_000,
+        # allenai/peS2o ships a loading script (peS2o.py) that newer `datasets`
+        # versions reject. Load the raw gzipped JSONL files directly instead.
+        "builder": "json",
+        "data_files": "hf://datasets/allenai/peS2o/data/v2/train-*.json.gz",
     },
     {
         "name": "fineweb_edu",
@@ -414,6 +418,8 @@ def prepare_stage2_data(args) -> None:
                 seed=args.seed,
                 max_seq_len=args.seq_len,
                 hf_token=hf_token,
+                data_files=source.get("data_files"),
+                builder=source.get("builder"),
             )
         prepared.append((source["name"], manifest["stats"]["total_tokens"]))
 

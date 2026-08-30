@@ -114,6 +114,8 @@ def prepare_dataset(
     seed: int = 42,
     max_seq_len: int = 1024,
     hf_token: str | None = None,
+    data_files: str | list | dict | None = None,
+    builder: str | None = None,
 ) -> dict:
     """Download, tokenize, and shard a dataset.
 
@@ -130,6 +132,13 @@ def prepare_dataset(
         seed: Shuffle seed for streaming datasets.
         max_seq_len: Sequence length (for manifest metadata only).
         hf_token: HuggingFace access token for gated datasets (e.g. StarCoderData).
+        data_files: Explicit data file(s) to load, bypassing any dataset loading
+            script (required for script-based datasets, which newer `datasets`
+            versions no longer support). Use hf:// URLs, e.g.
+            "hf://datasets/allenai/peS2o/data/v2/train-*.json.gz".
+        builder: Generic builder to use with ``data_files`` (e.g. "json",
+            "parquet", "text"). When set, ``dataset_name`` is ignored and the
+            builder loads ``data_files`` directly.
 
     Returns:
         Manifest dict describing the prepared data.
@@ -185,14 +194,28 @@ def prepare_dataset(
         tokens_to_skip = 0
 
     # Load dataset (streaming for large datasets)
-    logger.info(f"Loading dataset: {dataset_name} (subset={subset}, split={split}, streaming={streaming})")
     load_kwargs = {"split": split, "streaming": streaming}
     if hf_token:
         load_kwargs["token"] = hf_token
-    if subset:
-        ds = load_dataset(dataset_name, subset, **load_kwargs)
+
+    if builder is not None or data_files is not None:
+        # Explicit-files path: load with a generic builder (json/parquet/text)
+        # pointing at the raw data files. This bypasses any dataset loading
+        # script (e.g. peS2o.py), which newer `datasets` versions reject.
+        effective_builder = builder or "json"
+        logger.info(
+            f"Loading dataset via builder='{effective_builder}' data_files={data_files} "
+            f"(split={split}, streaming={streaming})"
+        )
+        ds = load_dataset(effective_builder, data_files=data_files, **load_kwargs)
     else:
-        ds = load_dataset(dataset_name, **load_kwargs)
+        logger.info(
+            f"Loading dataset: {dataset_name} (subset={subset}, split={split}, streaming={streaming})"
+        )
+        if subset:
+            ds = load_dataset(dataset_name, subset, **load_kwargs)
+        else:
+            ds = load_dataset(dataset_name, **load_kwargs)
 
     if streaming:
         ds = ds.shuffle(seed=seed, buffer_size=10_000)
