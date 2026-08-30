@@ -67,11 +67,19 @@ class ArmanConfig(PretrainedConfig):
                  use_attention=True, use_ssm=True, use_mlp=True, use_moe=True,
                  use_graph=False, use_memory=False, use_router=True,
                  tie_embeddings=True, **kwargs):
+        # Map our custom tie flag onto the HF-standard `tie_word_embeddings`
+        # that transformers 5.x uses to decide whether to tie weights.
+        kwargs.setdefault("tie_word_embeddings", tie_embeddings)
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.n_layers = n_layers
         self.n_heads = n_heads
+        # HF-standard aliases so transformers generation/cache utilities work.
+        self.num_hidden_layers = n_layers
+        self.num_attention_heads = n_heads
+        self.hidden_size = d_model
+        self.max_position_embeddings = max_seq_len
         self.max_seq_len = max_seq_len
         self.dropout = dropout
         self.ssm_state_size = ssm_state_size
@@ -111,7 +119,14 @@ from arman.model.model import ArmanNN
 class ArmanForCausalLM(PreTrainedModel):
     config_class = HFArmanConfig
     supports_gradient_checkpointing = True
-    _tied_weights_keys = ["model.lm_head.weight"]
+    # transformers>=5 expects a {target: source} mapping. lm_head is tied to
+    # the token embedding. (Older 4.x used a list; the dict form is required
+    # for the 5.x weight-tying loader to populate `all_tied_weights_keys`.)
+    _tied_weights_keys = {"model.lm_head.weight": "model.token_embedding.weight"}
+    # This model manages its own cache (attention KV + SSM state per layer),
+    # so it must not go through the standard transformers Cache classes.
+    _supports_cache_class = False
+    main_input_name = "input_ids"
 
     def __init__(self, config: HFArmanConfig):
         super().__init__(config)
@@ -129,6 +144,9 @@ class ArmanForCausalLM(PreTrainedModel):
             use_router=config.use_router, tie_embeddings=config.tie_embeddings,
         )
         self.model = ArmanNN(native_config)
+        # Populates all_tied_weights_keys, runs weight init hooks, etc. Required
+        # by transformers 5.x so the tied-weights loader works correctly.
+        self.post_init()
 
     def get_input_embeddings(self):
         return self.model.token_embedding
@@ -142,17 +160,30 @@ class ArmanForCausalLM(PreTrainedModel):
     def set_output_embeddings(self, new_embeddings):
         self.model.lm_head = new_embeddings
 
+    def _prepare_cache_for_generation(self, *args, **kwargs):
+        # No-op: the model returns and consumes its own custom cache
+        # (per-layer attention KV + SSM state) via past_key_values.
+        return None
+
     def forward(self, input_ids, attention_mask=None, labels=None, past_key_values=None, **kwargs):
-        out = self.model(input_ids, targets=labels, past_key_values=past_key_values)
+        out = self.model(
+            input_ids, targets=labels, past_key_values=past_key_values,
+            attention_mask=attention_mask,
+        )
         return CausalLMOutputWithPast(
             loss=out["loss"], logits=out["logits"],
             past_key_values=out["present_key_values"],
         )
 
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None,
+                                      attention_mask=None, **kwargs):
         if past_key_values is not None:
             input_ids = input_ids[:, -1:]
-        return {"input_ids": input_ids, "past_key_values": past_key_values}
+        return {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "attention_mask": attention_mask,
+        }
 
     def _set_gradient_checkpointing(self, module, value=False):
         if value:
@@ -220,6 +251,16 @@ def export_checkpoint(
     export_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. config.json (HF-style)
+    # HF-standard aliases derived from the native config, written explicitly so
+    # the config is self-describing and works with transformers>=5 loaders
+    # (cache building, weight tying) without relying on __init__ derivation.
+    hf_std_fields = {
+        "num_hidden_layers": config_dict.get("n_layers"),
+        "num_attention_heads": config_dict.get("n_heads"),
+        "hidden_size": config_dict.get("d_model"),
+        "max_position_embeddings": config_dict.get("max_seq_len"),
+        "tie_word_embeddings": config_dict.get("tie_embeddings", True),
+    }
     hf_config = {
         "architectures": ["ArmanForCausalLM"],
         "model_type": "arman-nn",
@@ -228,6 +269,7 @@ def export_checkpoint(
             "AutoModelForCausalLM": "modeling_arman.ArmanForCausalLM",
         },
         **config_dict,
+        **hf_std_fields,
         "torch_dtype": "bfloat16",
         "training_step": step,
     }
