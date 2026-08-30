@@ -9,14 +9,14 @@ Usage:
         --dataset HuggingFaceFW/fineweb-edu \
         --subset sample-10BT \
         --target_tokens 7_500_000_000 \
-        --output_dir ./data/pretrain/fineweb \
+        --output_dir ../../data/pretrain/fineweb \
         --tokenizer gpt2
 
     # Prepare code data (1.5B tokens):
     python prepare_data.py \
         --dataset bigcode/starcoderdata \
         --target_tokens 1_500_000_000 \
-        --output_dir ./data/pretrain/code \
+        --output_dir ../../data/pretrain/code \
         --tokenizer gpt2 \
         --text_column content
 
@@ -25,14 +25,14 @@ Usage:
         --dataset wikimedia/wikipedia \
         --subset 20231101.en \
         --target_tokens 1_000_000_000 \
-        --output_dir ./data/pretrain/wikipedia \
+        --output_dir ../../data/pretrain/wikipedia \
         --tokenizer gpt2
 
     # Prepare OpenWebMath (2B tokens):
     python prepare_data.py \
         --dataset open-web-math/open-web-math \
         --target_tokens 2_000_000_000 \
-        --output_dir ./data/pretrain/math \
+        --output_dir ../../data/pretrain/math \
         --tokenizer gpt2
 """
 

@@ -62,8 +62,8 @@ logger = logging.getLogger(__name__)
 # Output locations
 # ---------------------------------------------------------------------------
 
-STAGE2_ROOT = Path("data/pretrained_2")    # all stage-2 shards land here
-BASE_DATA_ROOT = Path("data/pretrained")   # stage-1 shards used for replay
+STAGE2_ROOT = Path("../../data/pretrained_2")    # all stage-2 shards land here
+BASE_DATA_ROOT = Path("../../data/pretrained")   # stage-1 shards used for replay
 
 
 # ---------------------------------------------------------------------------
