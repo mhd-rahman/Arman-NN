@@ -1,19 +1,31 @@
 """Standalone evaluation script for ArmanNN.
 
 Usage:
+    # Built-in toy sanity-check dataset:
     python evaluate.py --checkpoint checkpoints/step_001000.pt --dataset toy --batch_size 16
 
+    # Your own pre-tokenized binary shards (a single shard dir, or a parent dir
+    # containing multiple shard subfolders — same format as prepare_data.py output):
+    python evaluate.py --checkpoint checkpoints/step_001000.pt \
+        --dataset binary --data_path ./data/pretrained_2/wikipedia
+
+    # Your own eval cache produced by build_eval_dataset.py:
+    python evaluate.py --checkpoint checkpoints/step_001000.pt \
+        --dataset pt --data_path ./eval_dataset.pt
+
 For distributed evaluation:
-    torchrun --nproc_per_node=4 evaluate.py --checkpoint ... --dataset toy
+    torchrun --nproc_per_node=4 evaluate.py --checkpoint ... --dataset binary --data_path ./data/eval
 """
 
 import argparse
 import logging
+from pathlib import Path
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, ConcatDataset
 
 from arman.model import ArmanConfig, ArmanNN
+from arman.training.data import BinaryShardDataset
 from arman.training.evaluator import Evaluator, EvalConfig
 from arman.training.distributed import setup_distributed, cleanup_distributed, is_main_process
 from arman.training.checkpointing import load_checkpoint
@@ -46,10 +58,69 @@ class ToyEvalDataset(Dataset):
         return x, y
 
 
+class ListDataset(Dataset):
+    """Wraps a list of (input_ids, targets) tuples (e.g. from an eval_dataset.pt cache)."""
+
+    def __init__(self, samples):
+        self.samples = samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+
+def load_custom_dataset(kind: str, data_path: str, seq_len: int) -> Dataset:
+    """Load a user-provided eval dataset.
+
+    kind="binary": data_path is a shard directory with manifest.json, OR a parent
+                   directory containing multiple such shard subfolders. Loaded via
+                   BinaryShardDataset (memory-mapped) and concatenated.
+    kind="pt":     data_path is a .pt file containing a list of (input_ids, targets)
+                   tuples, as produced by build_eval_dataset.py.
+    """
+    if not data_path:
+        raise ValueError(f"--data_path is required when --dataset {kind}")
+
+    path = Path(data_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Eval data path not found: {path}")
+
+    if kind == "pt":
+        logger.info(f"Loading eval cache: {path}")
+        samples = torch.load(path, weights_only=False)
+        return ListDataset(samples)
+
+    # kind == "binary"
+    if path.is_dir() and (path / "manifest.json").exists():
+        return BinaryShardDataset(str(path), seq_len=seq_len)
+
+    if path.is_dir():
+        subfolders = sorted(
+            d for d in path.iterdir()
+            if d.is_dir() and (d / "manifest.json").exists()
+        )
+        if not subfolders:
+            raise FileNotFoundError(
+                f"No manifest.json in {path} and no shard subfolders found underneath it. "
+                f"Point --data_path at a directory produced by prepare_data.py."
+            )
+        datasets = [BinaryShardDataset(str(d), seq_len=seq_len) for d in subfolders]
+        return ConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
+
+    raise ValueError(f"--data_path {path} is not a directory; use --dataset pt for a .pt cache file.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate ArmanNN model")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
-    parser.add_argument("--dataset", type=str, default="toy", choices=["toy"], help="Evaluation dataset")
+    parser.add_argument("--dataset", type=str, default="toy", choices=["toy", "binary", "pt"],
+                        help="Evaluation dataset: 'toy' (built-in sanity check), "
+                             "'binary' (your pre-tokenized shard dir), or 'pt' (your eval_dataset.pt cache)")
+    parser.add_argument("--data_path", type=str, default=None,
+                        help="Path to your eval data. Required for --dataset binary (shard dir or "
+                             "parent of shard subfolders) and --dataset pt (a .pt file).")
     parser.add_argument("--batch_size", type=int, default=16, help="Evaluation batch size")
     parser.add_argument("--max_batches", type=int, default=0, help="Max batches to evaluate (0 = all)")
     parser.add_argument("--device", type=str, default="auto", help="Device (auto/cuda/cpu)")
@@ -88,6 +159,14 @@ def main():
             seq_len=config.max_seq_len,
             samples=args.samples,
         )
+    else:
+        eval_dataset = load_custom_dataset(
+            kind=args.dataset,
+            data_path=args.data_path,
+            seq_len=config.max_seq_len,
+        )
+        if is_main_process():
+            logger.info(f"Loaded custom eval dataset ({args.dataset}) from {args.data_path}")
 
     # Evaluate
     eval_config = EvalConfig(

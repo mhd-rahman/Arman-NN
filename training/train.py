@@ -2,16 +2,16 @@
 
 Usage:
     # Train on pre-tokenized binary shards (recommended):
-    python train.py --dataset_source binary --dataset_name ./data/pretrain/fineweb
+    python training/train.py --dataset_source binary --dataset_name ./data/pretrain/fineweb
 
     # Train on multiple binary shard directories (combined):
-    python train.py --dataset_source binary --dataset_name ./data/pretrain/fineweb,./data/pretrain/code,./data/pretrain/wikipedia,./data/pretrain/math
+    python training/train.py --dataset_source binary --dataset_name ./data/pretrain/fineweb,./data/pretrain/code,./data/pretrain/wikipedia,./data/pretrain/math
 
     # Train on a HuggingFace dataset:
-    python train.py --dataset_source huggingface --dataset_name wikitext --subset wikitext-2-raw-v1
+    python training/train.py --dataset_source huggingface --dataset_name wikitext --subset wikitext-2-raw-v1
 
     # Distributed training:
-    torchrun --nproc_per_node=4 train.py --dataset_source binary --dataset_name ./data/pretrain/fineweb
+    torchrun --nproc_per_node=4 training/train.py --dataset_source binary --dataset_name ./data/pretrain/fineweb
 """
 
 import argparse
@@ -19,8 +19,16 @@ import csv
 import json
 import signal
 import logging
+import sys
 import time
 from pathlib import Path
+
+# Ensure the repo root is importable regardless of where this script is invoked
+# from (it now lives under training/, so `python training/train.py` would
+# otherwise put training/ on sys.path instead of the repo root).
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import torch
 from torch.utils.data import DataLoader, ConcatDataset, Dataset
