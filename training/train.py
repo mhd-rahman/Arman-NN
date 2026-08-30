@@ -236,6 +236,15 @@ def main():
     p.add_argument("--keep_checkpoints", type=int, default=5, help="Number of checkpoints to keep")
     p.add_argument("--resume", action="store_true", default=True)
     p.add_argument("--no_resume", action="store_true")
+    p.add_argument("--init_from", type=str, default=None,
+                   help="Initialize MODEL WEIGHTS ONLY from this checkpoint, then start a "
+                        "fresh run at step 0 with a new optimizer and LR schedule. Use this "
+                        "for continued pretraining / a new training stage (does NOT restore "
+                        "optimizer or scheduler state or the step counter). Takes precedence "
+                        "over --resume.")
+    p.add_argument("--init_from_strict", type=str, default="true", choices=["true", "false"],
+                   help="When using --init_from, require checkpoint keys to match the model "
+                        "exactly (true) or load matching keys and ignore the rest (false).")
     p.add_argument("--metrics_log", type=str, default="training_metrics.csv",
                    help="CSV file for eval metrics log")
     p.add_argument("--eval_data", type=str, default=None,
@@ -389,12 +398,39 @@ def main():
     # ================================================================
     global_step = 0
     resume = args.resume and not args.no_resume
-    if resume:
-        ckpt_path = find_latest_checkpoint(args.checkpoint_dir)
-        if ckpt_path is not None:
+    # A checkpoint already in this stage's checkpoint_dir means an in-progress run
+    # of THIS stage — always prefer resuming it over re-initializing.
+    existing_ckpt = find_latest_checkpoint(args.checkpoint_dir) if resume else None
+
+    if args.init_from and existing_ckpt is None:
+        # New training stage: load ONLY the model weights and start fresh at step 0
+        # with the newly-constructed optimizer and LR schedule. Optimizer, scheduler,
+        # and step counter from the source checkpoint are intentionally NOT restored.
+        init_path = Path(args.init_from)
+        if not init_path.exists():
+            raise SystemExit(f"--init_from checkpoint not found: {init_path}")
+        if is_main_process():
+            logger.info(f"Initializing model weights from {init_path} (fresh optimizer + scheduler, step 0)")
+        info = load_checkpoint(
+            init_path, model, optimizer=None, scheduler=None, device=device,
+            strict=(args.init_from_strict == "true"),
+        )
+        if is_main_process():
+            logger.info(
+                f"Loaded weights from a checkpoint saved at step {info['step']}. "
+                f"Starting new stage at step 0 with lr={args.lr}, warmup={args.warmup_steps}, "
+                f"total_steps={args.steps}."
+            )
+    elif resume:
+        if existing_ckpt is not None:
             if is_main_process():
-                logger.info(f"Resuming from {ckpt_path}")
-            info = load_checkpoint(ckpt_path, model, optimizer=optimizer, scheduler=scheduler, device=device)
+                if args.init_from:
+                    logger.info(
+                        f"Found existing checkpoint in {args.checkpoint_dir} — resuming this "
+                        f"stage instead of re-initializing from --init_from."
+                    )
+                logger.info(f"Resuming from {existing_ckpt}")
+            info = load_checkpoint(existing_ckpt, model, optimizer=optimizer, scheduler=scheduler, device=device)
             global_step = info["step"]
             if is_main_process():
                 logger.info(f"Resumed at step {global_step}")
