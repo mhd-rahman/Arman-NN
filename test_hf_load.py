@@ -12,7 +12,7 @@ print(f"Model loaded! Device: {next(model.parameters()).device}")
 print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
 # Test generation
-prompt = "The capital of France is"
+prompt = "1 + 1 ="
 print(f"\nPrompt: {prompt}")
 
 inputs = tokenizer(prompt, return_tensors="pt")

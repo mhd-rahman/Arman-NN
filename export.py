@@ -102,18 +102,17 @@ class ArmanConfig(PretrainedConfig):
 '''
 
 MODELING_ARMAN_PY = '''"""ArmanNN model for HuggingFace transformers."""
-import sys
-from pathlib import Path
-
 import torch
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from .configuration_arman import ArmanConfig as HFArmanConfig
-
-sys.path.insert(0, str(Path(__file__).parent))
-from arman.model.config import ArmanConfig as NativeConfig
-from arman.model.model import ArmanNN
+# The full native model lives in the sibling module arman_native.py (a single
+# self-contained file). It is imported RELATIVELY so that transformers' remote-
+# code loader copies it into its module cache alongside this file. (A top-level
+# `import arman` would be rejected by the remote-code import checker as a missing
+# PyPI package, and a bundled `arman/` folder is not copied by the loader.)
+from .arman_native import ArmanConfig as NativeConfig, ArmanNN
 
 
 class ArmanForCausalLM(PreTrainedModel):
@@ -229,6 +228,57 @@ print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 
 
 # ---------------------------------------------------------------------------
+# Native model bundle: flatten arman/model/*.py into ONE self-contained module
+# ---------------------------------------------------------------------------
+# The exported repo must be self-contained in the .py files that transformers'
+# remote-code loader copies into its cache. A bundled `arman/` *folder* is NOT
+# copied, so we concatenate the native model source (in dependency order) into a
+# single sibling file `arman_native.py`, stripping the intra-package relative
+# imports (from .xxx import ...) since everything lives in one file after this.
+
+# Dependency order: leaves first, then modules that depend on them.
+_NATIVE_MODULE_ORDER = [
+    "config",
+    "mlp",
+    "attention",
+    "ssm",
+    "moe",
+    "router",
+    "graph",
+    "memory",
+    "block",
+    "model",
+]
+
+
+def _build_native_bundle() -> str:
+    """Concatenate arman/model/*.py into a single self-contained module source."""
+    import re
+
+    model_dir = _REPO_ROOT / "arman" / "model"
+    # Regex for intra-package relative imports like `from .block import ArmanBlock`.
+    # These are removed because all symbols end up in the same flattened module.
+    rel_import_re = re.compile(r"^\s*from\s+\.\w+\s+import\s+.*$")
+
+    parts = [
+        '"""ArmanNN native model — auto-generated flattened bundle.\n'
+        'Concatenation of arman/model/*.py so the HF remote-code loader can ship a\n'
+        'single self-contained module. Do not edit by hand; regenerate via export.py.\n'
+        '"""\n'
+    ]
+    for name in _NATIVE_MODULE_ORDER:
+        src_file = model_dir / f"{name}.py"
+        if not src_file.exists():
+            raise FileNotFoundError(f"Expected native model source missing: {src_file}")
+        lines = src_file.read_text().splitlines()
+        kept = [ln for ln in lines if not rel_import_re.match(ln)]
+        parts.append(f"# ===== from arman/model/{name}.py =====")
+        parts.append("\n".join(kept).strip("\n"))
+        parts.append("")  # blank separator
+    return "\n".join(parts) + "\n"
+
+
+# ---------------------------------------------------------------------------
 # Export
 # ---------------------------------------------------------------------------
 
@@ -242,10 +292,25 @@ def export_checkpoint(
     from safetensors.torch import save_file as save_safetensors
 
     logger.info(f"Loading checkpoint: {checkpoint_path}")
-    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    # mmap=True keeps tensors memory-mapped from disk instead of reading the whole
+    # file (model + optimizer state) into RAM at once — avoids OOM on large
+    # checkpoints. We only need the model weights and config for export, so we
+    # extract those and drop the rest (e.g. the AdamW optimizer state, which is
+    # ~2x the model size) before doing any work.
+    try:
+        state = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=False, mmap=True
+        )
+    except (TypeError, RuntimeError):
+        # Older torch without mmap support, or a format that can't be mmap'd.
+        logger.warning("mmap load unavailable — falling back to a regular load.")
+        state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
     model_state = state["model"]
     config_dict = state["config"]
     step = state.get("step", 0)
+    # Release references to optimizer/scheduler state so they can be freed.
+    state = None
     logger.info(f"Loaded checkpoint at step {step}")
 
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -278,13 +343,23 @@ def export_checkpoint(
     logger.info("Saved config.json")
 
     # 2. model weights as safetensors (skip tied lm_head)
+    # Move tensors out of model_state as we go (pop) so we never hold two full
+    # copies of the weights in RAM at once. safetensors requires contiguous CPU
+    # tensors that own their storage, so we detach+clone each one individually
+    # (a per-tensor copy, not a whole-model copy) right before handing it over.
     save_state = {}
-    for k, v in model_state.items():
+    total_params = 0
+    for k in list(model_state.keys()):
+        v = model_state.pop(k)
         if k == "lm_head.weight":
+            del v
             continue  # tied to token_embedding
-        save_state[f"model.{k}"] = v.contiguous().clone()
+        save_state[f"model.{k}"] = v.detach().to(torch.float32 if v.dtype == torch.float64 else v.dtype).contiguous().clone()
+        total_params += save_state[f"model.{k}"].numel()
+        del v
+    model_state = None
     save_safetensors(save_state, str(export_dir / "model.safetensors"))
-    logger.info(f"Saved model.safetensors ({sum(p.numel() for p in save_state.values()):,} parameters)")
+    logger.info(f"Saved model.safetensors ({total_params:,} parameters)")
     del save_state
 
     # 3. generation_config.json
@@ -307,16 +382,19 @@ def export_checkpoint(
         f.write(MODELING_ARMAN_PY)
     logger.info("Saved configuration_arman.py and modeling_arman.py")
 
-    # 5. copy the arman/ source package (needed by modeling_arman.py at runtime)
-    src_pkg = _REPO_ROOT / "arman"
-    dst_pkg = export_dir / "arman"
-    if dst_pkg.exists():
-        shutil.rmtree(dst_pkg)
-    shutil.copytree(
-        src_pkg, dst_pkg,
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-    )
-    logger.info("Copied arman/ package")
+    # 5. native model as a single self-contained sibling module. modeling_arman.py
+    #    imports it relatively (from .arman_native import ...), so the remote-code
+    #    loader copies it into its cache alongside the other .py files. (A bundled
+    #    arman/ *folder* would NOT be copied by the loader, which is why we flatten.)
+    native_bundle = _build_native_bundle()
+    with open(export_dir / "arman_native.py", "w") as f:
+        f.write(native_bundle)
+    logger.info("Wrote arman_native.py (flattened native model bundle)")
+
+    # Clean up any stale arman/ folder from an older export layout.
+    stale_pkg = export_dir / "arman"
+    if stale_pkg.exists():
+        shutil.rmtree(stale_pkg)
 
     # 6. tokenizer files
     from transformers import AutoTokenizer
